@@ -1,0 +1,10 @@
+services:
+  filestore-bot:
+    image: ghcr.io/driftywinds/forwarder
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DB_PATH: /app/data/filestore.db
+    volumes:
+      - ./data:/app/data
