@@ -72,6 +72,12 @@ func (b *Bot) handleMessage(m *tgbotapi.Message) {
 // ── /help ─────────────────────────────────────────────────────────────────────
 
 func (b *Bot) cmdHelp(m *tgbotapi.Message) {
+	// Deep link: /start <code>  →  deliver the file directly
+	if arg := strings.TrimSpace(m.CommandArguments()); arg != "" {
+		b.cmdSend(m)
+		return
+	}
+
 	if b.cfg.IsAdmin(m.From.ID) {
 		b.reply(m,
 			"*FileStore Bot — Admin*\n\n"+
