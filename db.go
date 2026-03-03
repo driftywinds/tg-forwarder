@@ -7,7 +7,7 @@ import (
 	"math/big"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
 
 const codeCharset = "abcdefghijklmnopqrstuvwxyz0123456789"
@@ -28,7 +28,7 @@ type DB struct {
 }
 
 func openDB(path string) (*DB, error) {
-	conn, err := sql.Open("sqlite3", path+"?_journal_mode=WAL&_busy_timeout=5000")
+	conn, err := sql.Open("sqlite", path+"?_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
