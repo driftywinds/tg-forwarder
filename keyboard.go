@@ -67,8 +67,8 @@ func BuildListKeyboard(records []*FileRecord, page, totalPages int) tgbotapi.Inl
 	for _, r := range records {
 		emoji := fileTypeEmoji(r.FileType)
 		date  := r.CreatedAt.Format("02 Jan 06")
-		name  := truncate(r.FileName, 24)
-		label := fmt.Sprintf("🗑  %s  %s  %-24s  %s", r.Code, emoji, name, date)
+		name  := truncate(r.FileName, 32)
+		label := fmt.Sprintf("🗑  %s  %s  %-32s  %s", r.Code, emoji, name, date)
 		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData(label, delCallbackData(r.Code)),
 		))

@@ -265,7 +265,7 @@ func (b *Bot) handleCallback(cq *tgbotapi.CallbackQuery) {
 		emoji := fileTypeEmoji(rec.FileType)
 		text  := fmt.Sprintf(
 			"❓ Delete `%s`?\n%s *%s*",
-			code, emoji, escMD(truncate(rec.FileName, 40)),
+			code, emoji, escMD(truncate(rec.FileName, 48)),
 		)
 		b.editTextAndKeyboard(cq.Message, text, BuildConfirmDeleteOne(rec))
 
