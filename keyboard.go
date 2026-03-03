@@ -183,9 +183,12 @@ func StatsText(total int, newest, oldest *FileRecord) string {
 // escMD escapes MarkdownV2 special characters in plain text.
 func escMD(s string) string {
 	replacer := strings.NewReplacer(
-		".", "\\.", "-", "\\-", "(", "\\(", ")", "\\)",
-		"!", "\\!", "+", "\\+", "=", "\\=", "|", "\\|",
-		"{", "\\{", "}", "\\}", "#", "\\#",
+		"\\", "\\\\",
+		"_", "\\_", "*", "\\*", "[", "\\[", "]", "\\]",
+		"(", "\\(", ")", "\\)", "~", "\\~", "`", "\\`",
+		">", "\\>", "#", "\\#", "+", "\\+", "-", "\\-",
+		"=", "\\=", "|", "\\|", "{", "\\{", "}", "\\}",
+		".", "\\.", "!", "\\!",
 	)
 	return replacer.Replace(s)
 }
