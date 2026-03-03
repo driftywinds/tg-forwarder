@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"math/big"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -25,6 +26,7 @@ type FileRecord struct {
 
 type DB struct {
 	conn *sql.DB
+	mu   sync.Mutex
 }
 
 func openDB(path string) (*DB, error) {
@@ -84,6 +86,9 @@ func (db *DB) generateCode() (string, error) {
 
 // Insert stores a new file record and returns its generated code.
 func (db *DB) Insert(chatID int64, messageID int, fileName, fileType string) (string, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
 	code, err := db.generateCode()
 	if err != nil {
 		return "", err
@@ -141,6 +146,9 @@ func (db *DB) Page(offset, limit int) ([]*FileRecord, error) {
 
 // Delete removes one record by code. Returns true if a row was deleted.
 func (db *DB) Delete(code string) (bool, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
 	res, err := db.conn.Exec("DELETE FROM files WHERE code = ?", code)
 	if err != nil {
 		return false, err
@@ -154,6 +162,9 @@ func (db *DB) DeleteMany(codes []string) (int64, error) {
 	if len(codes) == 0 {
 		return 0, nil
 	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
 	tx, err := db.conn.Begin()
 	if err != nil {
 		return 0, err
@@ -180,6 +191,9 @@ func (db *DB) DeleteMany(codes []string) (int64, error) {
 
 // DeleteAll removes every record. Returns count deleted.
 func (db *DB) DeleteAll() (int64, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
 	res, err := db.conn.Exec("DELETE FROM files")
 	if err != nil {
 		return 0, err
