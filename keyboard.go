@@ -3,33 +3,19 @@ package main
 import (
 	"fmt"
 	"strings"
-	"time"
 	"unicode/utf8"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
-// ── Callback data format ──────────────────────────────────────────────────────
-//
-//   page:<n>              → navigate to page n
-//   del:<code>            → single-delete prompt
-//   delok:<code>          → single-delete confirmed
-//   delpage:<n>           → delete-this-page prompt
-//   delpageok:<n>         → delete-this-page confirmed
-//   delall                → delete-all prompt
-//   delallok              → delete-all confirmed
-//   noop                  → no-op (display-only button)
-//   close                 → remove the list message
-//
-// ─────────────────────────────────────────────────────────────────────────────
+func truncate(s string, max int) string {
+	if utf8.RuneCountInString(s) <= max {
+		return s
+	}
+	runes := []rune(s)
+	return string(runes[:max-1]) + "…"
+}
 
-func pageCallbackData(n int) string       { return fmt.Sprintf("page:%d", n) }
-func delCallbackData(code string) string  { return "del:" + code }
-func delOKCallbackData(code string) string { return "delok:" + code }
-func delPageCallbackData(n int) string    { return fmt.Sprintf("delpage:%d", n) }
-func delPageOKCallbackData(n int) string  { return fmt.Sprintf("delpageok:%d", n) }
-
-// fileTypeEmoji maps the stored file type to a small emoji.
 func fileTypeEmoji(ft string) string {
 	switch ft {
 	case "photo":
@@ -51,30 +37,21 @@ func fileTypeEmoji(ft string) string {
 	}
 }
 
-// truncate cuts a string to max runes, appending "…" if needed.
-func truncate(s string, max int) string {
-	if utf8.RuneCountInString(s) <= max {
-		return s
-	}
-	runes := []rune(s)
-	return string(runes[:max-1]) + "…"
-}
-
-// BuildListKeyboard returns the inline keyboard for the main file list page.
-func BuildListKeyboard(records []*FileRecord, page, totalPages int) tgbotapi.InlineKeyboardMarkup {
+// BuildListKeyboard builds the paginated inline keyboard for /listfiles.
+// Each row shows one bundle: code · N files · date.
+func BuildListKeyboard(bundles []*Bundle, page, totalPages int) tgbotapi.InlineKeyboardMarkup {
 	var rows [][]tgbotapi.InlineKeyboardButton
 
-	for _, r := range records {
-		emoji := fileTypeEmoji(r.FileType)
-		date  := r.CreatedAt.Format("02 Jan 06")
-		name  := truncate(r.FileName, 32)
-		label := fmt.Sprintf("🗑  %s  %s  %-32s  %s", r.Code, emoji, name, date)
+	for _, bun := range bundles {
+		date  := bun.CreatedAt.Format("02 Jan 06")
+		files := fmt.Sprintf("%d file%s", bun.FileCount, pluralS(bun.FileCount))
+		label := fmt.Sprintf("🗑  %s  ·  %-10s  ·  %s", bun.Code, files, date)
 		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData(label, delCallbackData(r.Code)),
+			tgbotapi.NewInlineKeyboardButtonData(label, "del:"+bun.Code),
 		))
 	}
 
-	// ── navigation row ────────────────────────────────────────────────────────
+	// Navigation row
 	nav := []tgbotapi.InlineKeyboardButton{
 		tgbotapi.NewInlineKeyboardButtonData(
 			fmt.Sprintf("  %d / %d  ", page+1, totalPages), "noop",
@@ -82,19 +59,19 @@ func BuildListKeyboard(records []*FileRecord, page, totalPages int) tgbotapi.Inl
 	}
 	if page > 0 {
 		nav = append([]tgbotapi.InlineKeyboardButton{
-			tgbotapi.NewInlineKeyboardButtonData("◀ Prev", pageCallbackData(page-1)),
+			tgbotapi.NewInlineKeyboardButtonData("◀ Prev", fmt.Sprintf("page:%d", page-1)),
 		}, nav...)
 	}
 	if page < totalPages-1 {
 		nav = append(nav,
-			tgbotapi.NewInlineKeyboardButtonData("Next ▶", pageCallbackData(page+1)),
+			tgbotapi.NewInlineKeyboardButtonData("Next ▶", fmt.Sprintf("page:%d", page+1)),
 		)
 	}
 	rows = append(rows, nav)
 
-	// ── bulk / close row ──────────────────────────────────────────────────────
+	// Bulk row
 	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
-		tgbotapi.NewInlineKeyboardButtonData("🗑 Delete This Page", delPageCallbackData(page)),
+		tgbotapi.NewInlineKeyboardButtonData("🗑 Delete This Page", fmt.Sprintf("delpage:%d", page)),
 		tgbotapi.NewInlineKeyboardButtonData("💣 Delete ALL",       "delall"),
 		tgbotapi.NewInlineKeyboardButtonData("✖ Close",             "close"),
 	))
@@ -102,30 +79,24 @@ func BuildListKeyboard(records []*FileRecord, page, totalPages int) tgbotapi.Inl
 	return tgbotapi.NewInlineKeyboardMarkup(rows...)
 }
 
-// BuildConfirmDeleteOne returns a two-button confirm keyboard for a single file.
-func BuildConfirmDeleteOne(r *FileRecord) tgbotapi.InlineKeyboardMarkup {
-	emoji := fileTypeEmoji(r.FileType)
-	label := fmt.Sprintf("%s %s  ·  %s", emoji, r.Code, truncate(r.FileName, 28))
-	_ = label
+func BuildConfirmDeleteOne(code string, fileCount int) tgbotapi.InlineKeyboardMarkup {
 	return tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("✅ Yes, delete", delOKCallbackData(r.Code)),
+			tgbotapi.NewInlineKeyboardButtonData("✅ Yes, delete", "delok:"+code),
 			tgbotapi.NewInlineKeyboardButtonData("❌ Cancel",      "noop"),
 		),
 	)
 }
 
-// BuildConfirmDeletePage returns confirm keyboard for deleting a whole page.
 func BuildConfirmDeletePage(page int) tgbotapi.InlineKeyboardMarkup {
 	return tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("✅ Delete this page", delPageOKCallbackData(page)),
+			tgbotapi.NewInlineKeyboardButtonData("✅ Delete this page", fmt.Sprintf("delpageok:%d", page)),
 			tgbotapi.NewInlineKeyboardButtonData("❌ Cancel",           "noop"),
 		),
 	)
 }
 
-// BuildConfirmDeleteAll returns confirm keyboard for deleting everything.
 func BuildConfirmDeleteAll() tgbotapi.InlineKeyboardMarkup {
 	return tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
@@ -135,10 +106,9 @@ func BuildConfirmDeleteAll() tgbotapi.InlineKeyboardMarkup {
 	)
 }
 
-// ListMessageText returns the header text for the list view.
 func ListMessageText(total, page, pageSize int) string {
 	if total == 0 {
-		return "📂 *File Store* — no files stored yet\\."
+		return "📂 *Bundle Store* — no bundles stored yet\\."
 	}
 	start := page*pageSize + 1
 	end   := (page+1)*pageSize
@@ -147,7 +117,7 @@ func ListMessageText(total, page, pageSize int) string {
 	}
 	totalPages := (total + pageSize - 1) / pageSize
 	return fmt.Sprintf(
-		"📂 *File Store* — %d file%s\n"+
+		"📂 *Bundle Store* — %d bundle%s\n"+
 			"_Page %d of %d · showing %d–%d · tap a row to delete_",
 		total, pluralS(total),
 		page+1, totalPages,
@@ -155,32 +125,26 @@ func ListMessageText(total, page, pageSize int) string {
 	)
 }
 
-func pluralS(n int) string {
-	if n == 1 {
-		return ""
-	}
-	return "s"
-}
-
-// FormatTimestamp is a small helper used in handler messages.
-func FormatTimestamp(t time.Time) string {
-	return t.UTC().Format("02 Jan 2006, 15:04 UTC")
-}
-
-// StatsText builds the text for /stats.
-func StatsText(total int, newest, oldest *FileRecord) string {
+func StatsText(total int, newest, oldest *Bundle) string {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("📊 *Storage Stats*\n\nTotal files: *%d*\n", total))
+	sb.WriteString(fmt.Sprintf("📊 *Storage Stats*\n\nTotal bundles: *%d*\n", total))
 	if newest != nil {
-		sb.WriteString(fmt.Sprintf("Newest: `%s` \\(%s\\)\n", newest.Code, escMD(FormatTimestamp(newest.CreatedAt))))
+		sb.WriteString(fmt.Sprintf(
+			"Newest: `%s` \\(%d file%s, %s\\)\n",
+			newest.Code, newest.FileCount, pluralS(newest.FileCount),
+			escMD(newest.CreatedAt.UTC().Format("02 Jan 2006, 15:04 UTC")),
+		))
 	}
 	if oldest != nil && oldest.Code != newest.Code {
-		sb.WriteString(fmt.Sprintf("Oldest: `%s` \\(%s\\)\n", oldest.Code, escMD(FormatTimestamp(oldest.CreatedAt))))
+		sb.WriteString(fmt.Sprintf(
+			"Oldest: `%s` \\(%d file%s, %s\\)\n",
+			oldest.Code, oldest.FileCount, pluralS(oldest.FileCount),
+			escMD(oldest.CreatedAt.UTC().Format("02 Jan 2006, 15:04 UTC")),
+		))
 	}
 	return sb.String()
 }
 
-// escMD escapes MarkdownV2 special characters in plain text.
 func escMD(s string) string {
 	replacer := strings.NewReplacer(
 		"\\", "\\\\",
@@ -191,4 +155,11 @@ func escMD(s string) string {
 		".", "\\.", "!", "\\!",
 	)
 	return replacer.Replace(s)
+}
+
+func pluralS(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
 }

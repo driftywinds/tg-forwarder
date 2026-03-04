@@ -14,13 +14,21 @@ import (
 const codeCharset = "abcdefghijklmnopqrstuvwxyz0123456789"
 const codeLength = 9
 
-// FileRecord holds one stored file entry.
-type FileRecord struct {
+// BundleMessage is one message within a bundle.
+type BundleMessage struct {
+	ID        int64
 	Code      string
 	ChatID    int64
 	MessageID int
 	FileName  string
 	FileType  string
+	Position  int
+}
+
+// Bundle is the top-level record for a code.
+type Bundle struct {
+	Code      string
+	FileCount int
 	CreatedAt time.Time
 }
 
@@ -43,21 +51,25 @@ func openDB(path string) (*DB, error) {
 
 func (db *DB) migrate() error {
 	_, err := db.conn.Exec(`
-		CREATE TABLE IF NOT EXISTS files (
-			code        TEXT    PRIMARY KEY,
-			chat_id     INTEGER NOT NULL,
-			message_id  INTEGER NOT NULL,
-			file_name   TEXT    NOT NULL DEFAULT 'file',
-			file_type   TEXT    NOT NULL DEFAULT 'document',
-			created_at  TEXT    NOT NULL
+		CREATE TABLE IF NOT EXISTS bundles (
+			code       TEXT PRIMARY KEY,
+			created_at TEXT NOT NULL
 		);
-		CREATE INDEX IF NOT EXISTS idx_files_created ON files(created_at DESC);
+		CREATE TABLE IF NOT EXISTS bundle_messages (
+			id         INTEGER PRIMARY KEY AUTOINCREMENT,
+			code       TEXT    NOT NULL REFERENCES bundles(code) ON DELETE CASCADE,
+			chat_id    INTEGER NOT NULL,
+			message_id INTEGER NOT NULL,
+			file_name  TEXT    NOT NULL DEFAULT 'file',
+			file_type  TEXT    NOT NULL DEFAULT 'document',
+			position   INTEGER NOT NULL DEFAULT 0
+		);
+		CREATE INDEX IF NOT EXISTS idx_bm_code ON bundle_messages(code, position);
+		PRAGMA foreign_keys = ON;
 	`)
 	return err
 }
 
-// generateCode produces a cryptographically random 9-char alphanumeric code
-// that does not already exist in the database.
 func (db *DB) generateCode() (string, error) {
 	charsetLen := big.NewInt(int64(len(codeCharset)))
 	for attempts := 0; attempts < 10; attempts++ {
@@ -70,10 +82,9 @@ func (db *DB) generateCode() (string, error) {
 			buf[i] = codeCharset[n.Int64()]
 		}
 		code := string(buf)
-
 		var exists int
 		if err := db.conn.QueryRow(
-			"SELECT COUNT(*) FROM files WHERE code = ?", code,
+			"SELECT COUNT(*) FROM bundles WHERE code = ?", code,
 		).Scan(&exists); err != nil {
 			return "", err
 		}
@@ -84,8 +95,8 @@ func (db *DB) generateCode() (string, error) {
 	return "", fmt.Errorf("could not generate unique code after 10 attempts")
 }
 
-// Insert stores a new file record and returns its generated code.
-func (db *DB) Insert(chatID int64, messageID int, fileName, fileType string) (string, error) {
+// InsertBundle saves a completed bundle and all its messages atomically.
+func (db *DB) InsertBundle(messages []BundleMessage) (string, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -93,63 +104,109 @@ func (db *DB) Insert(chatID int64, messageID int, fileName, fileType string) (st
 	if err != nil {
 		return "", err
 	}
-	_, err = db.conn.Exec(
-		`INSERT INTO files (code, chat_id, message_id, file_name, file_type, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		code, chatID, messageID, fileName, fileType,
-		time.Now().UTC().Format(time.RFC3339),
+
+	tx, err := db.conn.Begin()
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+
+	_, err = tx.Exec(
+		"INSERT INTO bundles (code, created_at) VALUES (?, ?)",
+		code, time.Now().UTC().Format(time.RFC3339),
 	)
 	if err != nil {
-		return "", fmt.Errorf("insert: %w", err)
+		return "", fmt.Errorf("insert bundle: %w", err)
 	}
-	return code, nil
+
+	stmt, err := tx.Prepare(`
+		INSERT INTO bundle_messages (code, chat_id, message_id, file_name, file_type, position)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		return "", err
+	}
+	defer stmt.Close()
+
+	for i, m := range messages {
+		if _, err := stmt.Exec(code, m.ChatID, m.MessageID, m.FileName, m.FileType, i); err != nil {
+			return "", fmt.Errorf("insert message %d: %w", i, err)
+		}
+	}
+
+	return code, tx.Commit()
 }
 
-// Get looks up a file record by code. Returns nil, nil if not found.
-func (db *DB) Get(code string) (*FileRecord, error) {
-	row := db.conn.QueryRow(
-		`SELECT code, chat_id, message_id, file_name, file_type, created_at
-		 FROM files WHERE code = ?`, code,
-	)
-	return scanRecord(row)
-}
+// GetBundle returns all messages for a code ordered by position. nil,nil if not found.
+func (db *DB) GetBundle(code string) ([]BundleMessage, error) {
+	var exists int
+	if err := db.conn.QueryRow(
+		"SELECT COUNT(*) FROM bundles WHERE code = ?", code,
+	).Scan(&exists); err != nil {
+		return nil, err
+	}
+	if exists == 0 {
+		return nil, nil
+	}
 
-// Count returns the total number of stored files.
-func (db *DB) Count() (int, error) {
-	var n int
-	err := db.conn.QueryRow("SELECT COUNT(*) FROM files").Scan(&n)
-	return n, err
-}
-
-// Page returns one page of records ordered by created_at DESC.
-func (db *DB) Page(offset, limit int) ([]*FileRecord, error) {
-	rows, err := db.conn.Query(
-		`SELECT code, chat_id, message_id, file_name, file_type, created_at
-		 FROM files ORDER BY created_at DESC LIMIT ? OFFSET ?`,
-		limit, offset,
-	)
+	rows, err := db.conn.Query(`
+		SELECT id, code, chat_id, message_id, file_name, file_type, position
+		FROM bundle_messages WHERE code = ? ORDER BY position ASC
+	`, code)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var records []*FileRecord
+	var msgs []BundleMessage
 	for rows.Next() {
-		r, err := scanRecord(rows)
-		if err != nil {
+		var m BundleMessage
+		if err := rows.Scan(&m.ID, &m.Code, &m.ChatID, &m.MessageID, &m.FileName, &m.FileType, &m.Position); err != nil {
 			return nil, err
 		}
-		records = append(records, r)
+		msgs = append(msgs, m)
 	}
-	return records, rows.Err()
+	return msgs, rows.Err()
 }
 
-// Delete removes one record by code. Returns true if a row was deleted.
-func (db *DB) Delete(code string) (bool, error) {
+func (db *DB) CountBundles() (int, error) {
+	var n int
+	err := db.conn.QueryRow("SELECT COUNT(*) FROM bundles").Scan(&n)
+	return n, err
+}
+
+func (db *DB) PageBundles(offset, limit int) ([]*Bundle, error) {
+	rows, err := db.conn.Query(`
+		SELECT b.code, COUNT(m.id) as file_count, b.created_at
+		FROM bundles b
+		LEFT JOIN bundle_messages m ON m.code = b.code
+		GROUP BY b.code
+		ORDER BY b.created_at DESC
+		LIMIT ? OFFSET ?
+	`, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var bundles []*Bundle
+	for rows.Next() {
+		var bun Bundle
+		var createdAt string
+		if err := rows.Scan(&bun.Code, &bun.FileCount, &createdAt); err != nil {
+			return nil, err
+		}
+		bun.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
+		bundles = append(bundles, &bun)
+	}
+	return bundles, rows.Err()
+}
+
+func (db *DB) DeleteBundle(code string) (bool, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-
-	res, err := db.conn.Exec("DELETE FROM files WHERE code = ?", code)
+	db.conn.Exec("PRAGMA foreign_keys = ON")
+	res, err := db.conn.Exec("DELETE FROM bundles WHERE code = ?", code)
 	if err != nil {
 		return false, err
 	}
@@ -157,8 +214,7 @@ func (db *DB) Delete(code string) (bool, error) {
 	return n > 0, nil
 }
 
-// DeleteMany removes multiple records by code. Returns count deleted.
-func (db *DB) DeleteMany(codes []string) (int64, error) {
+func (db *DB) DeleteBundles(codes []string) (int64, error) {
 	if len(codes) == 0 {
 		return 0, nil
 	}
@@ -169,9 +225,10 @@ func (db *DB) DeleteMany(codes []string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer tx.Rollback() //nolint:errcheck
+	defer tx.Rollback()
+	tx.Exec("PRAGMA foreign_keys = ON")
 
-	stmt, err := tx.Prepare("DELETE FROM files WHERE code = ?")
+	stmt, err := tx.Prepare("DELETE FROM bundles WHERE code = ?")
 	if err != nil {
 		return 0, err
 	}
@@ -189,22 +246,20 @@ func (db *DB) DeleteMany(codes []string) (int64, error) {
 	return total, tx.Commit()
 }
 
-// DeleteAll removes every record. Returns count deleted.
-func (db *DB) DeleteAll() (int64, error) {
+func (db *DB) DeleteAllBundles() (int64, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-
-	res, err := db.conn.Exec("DELETE FROM files")
+	db.conn.Exec("PRAGMA foreign_keys = ON")
+	res, err := db.conn.Exec("DELETE FROM bundles")
 	if err != nil {
 		return 0, err
 	}
 	return res.RowsAffected()
 }
 
-// CodesOnPage returns just the codes for a given page (used for bulk-delete page).
 func (db *DB) CodesOnPage(offset, limit int) ([]string, error) {
 	rows, err := db.conn.Query(
-		`SELECT code FROM files ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+		"SELECT code FROM bundles ORDER BY created_at DESC LIMIT ? OFFSET ?",
 		limit, offset,
 	)
 	if err != nil {
@@ -220,24 +275,4 @@ func (db *DB) CodesOnPage(offset, limit int) ([]string, error) {
 		codes = append(codes, c)
 	}
 	return codes, rows.Err()
-}
-
-// ── helpers ───────────────────────────────────────────────────────────────────
-
-type scanner interface {
-	Scan(dest ...any) error
-}
-
-func scanRecord(s scanner) (*FileRecord, error) {
-	var r FileRecord
-	var createdAt string
-	err := s.Scan(&r.Code, &r.ChatID, &r.MessageID, &r.FileName, &r.FileType, &createdAt)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	r.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
-	return &r, nil
 }

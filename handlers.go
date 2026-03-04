@@ -8,15 +8,20 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
-// Bot wraps the API client, database and config together.
 type Bot struct {
-	api  *tgbotapi.BotAPI
-	db   *DB
-	cfg  *Config
+	api      *tgbotapi.BotAPI
+	db       *DB
+	cfg      *Config
+	sessions *SessionStore
 }
 
 func NewBot(api *tgbotapi.BotAPI, db *DB, cfg *Config) *Bot {
-	return &Bot{api: api, db: db, cfg: cfg}
+	return &Bot{
+		api:      api,
+		db:       db,
+		cfg:      cfg,
+		sessions: NewSessionStore(),
+	}
 }
 
 // ── Dispatch ──────────────────────────────────────────────────────────────────
@@ -35,13 +40,24 @@ func (b *Bot) HandleUpdate(u tgbotapi.Update) {
 func (b *Bot) handleMessage(m *tgbotapi.Message) {
 	uid := m.From.ID
 
-	// Commands
 	if m.IsCommand() {
 		switch m.Command() {
 		case "start", "help":
 			b.cmdHelp(m)
 		case "send":
 			b.cmdSend(m)
+		case "begin":
+			if b.requireAdmin(m) {
+				b.cmdBegin(m)
+			}
+		case "done":
+			if b.requireAdmin(m) {
+				b.cmdDone(m)
+			}
+		case "cancel":
+			if b.requireAdmin(m) {
+				b.cmdCancel(m)
+			}
 		case "listfiles":
 			if b.requireAdmin(m) {
 				b.cmdListFiles(m, 0)
@@ -62,9 +78,9 @@ func (b *Bot) handleMessage(m *tgbotapi.Message) {
 		return
 	}
 
-	// File upload (admins only)
+	// File received from admin
 	if b.cfg.IsAdmin(uid) && hasFile(m) {
-		b.handleFileUpload(m)
+		b.handleFileFromAdmin(m)
 		return
 	}
 }
@@ -72,7 +88,7 @@ func (b *Bot) handleMessage(m *tgbotapi.Message) {
 // ── /help ─────────────────────────────────────────────────────────────────────
 
 func (b *Bot) cmdHelp(m *tgbotapi.Message) {
-	// Deep link: /start <code>  →  deliver the file directly
+	// Deep link: /start <code> → deliver files directly
 	if arg := strings.TrimSpace(m.CommandArguments()); arg != "" {
 		b.cmdSend(m)
 		return
@@ -81,21 +97,117 @@ func (b *Bot) cmdHelp(m *tgbotapi.Message) {
 	if b.cfg.IsAdmin(m.From.ID) {
 		b.reply(m,
 			"*FileStore Bot — Admin*\n\n"+
-				"*Upload a file*: just send it here → you get a 9\\-char code\\.\n\n"+
-				"*Commands*\n"+
-				"`/send <code>` — retrieve a file by code\n"+
-				"`/listfiles` — browse & delete stored files\n"+
-				"`/delete <code> [code …]` — delete one or more files by code\n"+
-				"`/stats` — storage summary\n"+
-				"`/help` — this message",
+				"*Creating a bundle*\n"+
+				"`/begin` — start a new bundle\n"+
+				"_Send as many files as you want_\n"+
+				"`/done` — save the bundle and get a code\n"+
+				"`/cancel` — discard the current bundle\n\n"+
+				"*Managing files*\n"+
+				"`/listfiles` — browse & delete bundles\n"+
+				"`/delete <code> [code …]` — delete by code\\(s\\)\n"+
+				"`/stats` — storage summary\n\n"+
+				"*Retrieving*\n"+
+				"`/send <code>` — retrieve a bundle by code",
 		)
 	} else {
 		b.reply(m,
 			"*FileStore Bot*\n\n"+
-				"Use `/send <code>` to retrieve a file\\.\n"+
+				"Use `/send <code>` to retrieve files\\.\n"+
 				"Example: `/send abcd56789`",
 		)
 	}
+}
+
+// ── /begin ────────────────────────────────────────────────────────────────────
+
+func (b *Bot) cmdBegin(m *tgbotapi.Message) {
+	if !b.sessions.Begin(m.From.ID) {
+		count := b.sessions.Count(m.From.ID)
+		b.reply(m, fmt.Sprintf(
+			"⚠️ You already have an active bundle with *%d* file%s queued\\.\n"+
+				"Send more files, `/done` to save, or `/cancel` to discard\\.",
+			count, pluralS(count),
+		))
+		return
+	}
+	b.reply(m,
+		"📦 *Bundle started\\!*\n\n"+
+			"Send me all the files for this bundle now\\.\n"+
+			"When you're done, send `/done` to save and get a code\\.\n"+
+			"Send `/cancel` to discard without saving\\.",
+	)
+}
+
+// ── /done ─────────────────────────────────────────────────────────────────────
+
+func (b *Bot) cmdDone(m *tgbotapi.Message) {
+	msgs := b.sessions.End(m.From.ID)
+	if msgs == nil {
+		b.reply(m, "⚠️ No active bundle\\. Start one with `/begin`\\.")
+		return
+	}
+	if len(msgs) == 0 {
+		b.reply(m, "⚠️ Bundle is empty — you didn't send any files\\. Use `/begin` to start again\\.")
+		return
+	}
+
+	code, err := b.db.InsertBundle(msgs)
+	if err != nil {
+		log.Printf("InsertBundle error: %v", err)
+		b.reply(m, "⚠️ Failed to save bundle\\. Please try again\\.")
+		return
+	}
+
+	b.reply(m, fmt.Sprintf(
+		"✅ *Bundle saved\\!*\n\n"+
+			"Code: `%s`\n"+
+			"Files: *%d*\n\n"+
+			"Share this code or link:\n"+
+			"`/send %s`\n"+
+			"🔗 `https://t\\.me/%s?start=%s`",
+		code, len(msgs), code,
+		escMD(b.api.Self.UserName), code,
+	))
+}
+
+// ── /cancel ───────────────────────────────────────────────────────────────────
+
+func (b *Bot) cmdCancel(m *tgbotapi.Message) {
+	if !b.sessions.Cancel(m.From.ID) {
+		b.reply(m, "No active bundle to cancel\\.")
+		return
+	}
+	b.reply(m, "🗑 Bundle discarded\\.")
+}
+
+// ── File received from admin ──────────────────────────────────────────────────
+
+func (b *Bot) handleFileFromAdmin(m *tgbotapi.Message) {
+	uid := m.From.ID
+
+	if !b.sessions.IsRecording(uid) {
+		b.reply(m,
+			"ℹ️ Start a bundle first with `/begin`, then send your files\\.",
+		)
+		return
+	}
+
+	fileName, fileType := extractFileInfo(m)
+	msg := BundleMessage{
+		ChatID:    m.Chat.ID,
+		MessageID: m.MessageID,
+		FileName:  fileName,
+		FileType:  fileType,
+	}
+
+	b.sessions.Append(uid, msg)
+	count := b.sessions.Count(uid)
+
+	emoji := fileTypeEmoji(fileType)
+	b.reply(m, fmt.Sprintf(
+		"%s Added `%s`\n_Bundle total: %d file%s — send `/done` when finished_",
+		emoji, escMD(truncate(fileName, 40)), count, pluralS(count),
+	))
 }
 
 // ── /send <code> ──────────────────────────────────────────────────────────────
@@ -107,58 +219,39 @@ func (b *Bot) cmdSend(m *tgbotapi.Message) {
 		return
 	}
 
-	rec, err := b.db.Get(code)
+	msgs, err := b.db.GetBundle(code)
 	if err != nil {
-		log.Printf("db.Get error: %v", err)
+		log.Printf("GetBundle error: %v", err)
 		b.reply(m, "⚠️ Internal error\\. Please try again\\.")
 		return
 	}
-	if rec == nil {
+	if msgs == nil {
 		b.reply(m, fmt.Sprintf("❌ Code `%s` not found\\.", escMD(code)))
 		return
 	}
 
-	// CopyMessage sends the file without exposing the source chat/user.
-	copy := tgbotapi.NewCopyMessage(m.Chat.ID, rec.ChatID, rec.MessageID)
-	if _, err := b.api.CopyMessage(copy); err != nil {
-		log.Printf("CopyMessage error: %v", err)
-		b.reply(m, "⚠️ Could not deliver the file\\. It may have been deleted from the source chat\\.")
+	for _, msg := range msgs {
+		cp := tgbotapi.NewCopyMessage(m.Chat.ID, msg.ChatID, msg.MessageID)
+		if _, err := b.api.CopyMessage(cp); err != nil {
+			log.Printf("CopyMessage error for %s msg %d: %v", code, msg.MessageID, err)
+			b.reply(m, fmt.Sprintf(
+				"⚠️ Could not deliver file %d of %d — it may have been deleted from the source\\.",
+				msg.Position+1, len(msgs),
+			))
+		}
 	}
-}
-
-// ── File upload handler ───────────────────────────────────────────────────────
-
-func (b *Bot) handleFileUpload(m *tgbotapi.Message) {
-	fileName, fileType := extractFileInfo(m)
-
-	code, err := b.db.Insert(m.Chat.ID, m.MessageID, fileName, fileType)
-	if err != nil {
-		log.Printf("db.Insert error: %v", err)
-		b.reply(m, "⚠️ Failed to store file\\. Please try again\\.")
-		return
-	}
-
-	emoji := fileTypeEmoji(fileType)
-	text := fmt.Sprintf(
-		"%s File stored\\!\n\n"+
-			"Code: `%s`\n"+
-			"Name: %s\n\n"+
-			"Share this code with users — they can retrieve it with `/send %s`",
-		emoji, code, escMD(fileName), code,
-	)
-	b.reply(m, text)
 }
 
 // ── /listfiles ────────────────────────────────────────────────────────────────
 
 func (b *Bot) cmdListFiles(m *tgbotapi.Message, page int) {
-	total, err := b.db.Count()
+	total, err := b.db.CountBundles()
 	if err != nil {
 		b.reply(m, "⚠️ DB error\\.")
 		return
 	}
 	if total == 0 {
-		b.reply(m, "📂 No files stored yet\\.")
+		b.reply(m, "📂 No bundles stored yet\\.")
 		return
 	}
 
@@ -168,19 +261,19 @@ func (b *Bot) cmdListFiles(m *tgbotapi.Message, page int) {
 		page = totalPages - 1
 	}
 
-	records, err := b.db.Page(page*pageSize, pageSize)
+	bundles, err := b.db.PageBundles(page*pageSize, pageSize)
 	if err != nil {
 		b.reply(m, "⚠️ DB error\\.")
 		return
 	}
 
 	text := ListMessageText(total, page, pageSize)
-	kb   := BuildListKeyboard(records, page, totalPages)
+	kb   := BuildListKeyboard(bundles, page, totalPages)
 
 	msg := tgbotapi.NewMessage(m.Chat.ID, text)
-	msg.ParseMode    = tgbotapi.ModeMarkdownV2
-	msg.ReplyMarkup  = kb
-	b.api.Send(msg) //nolint:errcheck
+	msg.ParseMode   = tgbotapi.ModeMarkdownV2
+	msg.ReplyMarkup = kb
+	b.api.Send(msg)
 }
 
 // ── /delete <code> [code …] ───────────────────────────────────────────────────
@@ -192,40 +285,37 @@ func (b *Bot) cmdDelete(m *tgbotapi.Message) {
 		return
 	}
 
-	deleted, err := b.db.DeleteMany(args)
+	deleted, err := b.db.DeleteBundles(args)
 	if err != nil {
-		log.Printf("db.DeleteMany error: %v", err)
+		log.Printf("DeleteBundles error: %v", err)
 		b.reply(m, "⚠️ DB error during deletion\\.")
 		return
 	}
 
 	notFound := int64(len(args)) - deleted
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("🗑 Deleted *%d* file%s\\.", deleted, pluralS(int(deleted))))
+	text := fmt.Sprintf("🗑 Deleted *%d* bundle%s\\.", deleted, pluralS(int(deleted)))
 	if notFound > 0 {
-		sb.WriteString(fmt.Sprintf("\n_%d code%s not found\\._", notFound, pluralS(int(notFound))))
+		text += fmt.Sprintf("\n_%d code%s not found\\._", notFound, pluralS(int(notFound)))
 	}
-	b.reply(m, sb.String())
+	b.reply(m, text)
 }
 
 // ── /stats ────────────────────────────────────────────────────────────────────
 
 func (b *Bot) cmdStats(m *tgbotapi.Message) {
-	total, err := b.db.Count()
+	total, err := b.db.CountBundles()
 	if err != nil {
 		b.reply(m, "⚠️ DB error\\.")
 		return
 	}
 
-	var newest, oldest *FileRecord
+	var newest, oldest *Bundle
 	if total > 0 {
-		recs, _ := b.db.Page(0, 1)
-		if len(recs) > 0 {
-			newest = recs[0]
+		if bundles, _ := b.db.PageBundles(0, 1); len(bundles) > 0 {
+			newest = bundles[0]
 		}
-		recs, _ = b.db.Page(total-1, 1)
-		if len(recs) > 0 {
-			oldest = recs[0]
+		if bundles, _ := b.db.PageBundles(total-1, 1); len(bundles) > 0 {
+			oldest = bundles[0]
 		}
 	}
 	b.reply(m, StatsText(total, newest, oldest))
@@ -237,13 +327,12 @@ func (b *Bot) handleCallback(cq *tgbotapi.CallbackQuery) {
 	uid  := cq.From.ID
 	data := cq.Data
 
-	// Always answer the callback to clear the loading spinner.
 	defer func() {
-		b.api.Request(tgbotapi.NewCallback(cq.ID, "")) //nolint:errcheck
+		b.api.Request(tgbotapi.NewCallback(cq.ID, ""))
 	}()
 
 	if !b.cfg.IsAdmin(uid) {
-		b.api.Request(tgbotapi.NewCallbackWithAlert(cq.ID, "⛔ Admins only")) //nolint:errcheck
+		b.api.Request(tgbotapi.NewCallbackWithAlert(cq.ID, "⛔ Admins only"))
 		return
 	}
 
@@ -252,35 +341,29 @@ func (b *Bot) handleCallback(cq *tgbotapi.CallbackQuery) {
 		return
 
 	case data == "close":
-		del := tgbotapi.NewDeleteMessage(cq.Message.Chat.ID, cq.Message.MessageID)
-		b.api.Request(del) //nolint:errcheck
+		b.api.Request(tgbotapi.NewDeleteMessage(cq.Message.Chat.ID, cq.Message.MessageID))
 
-	// ── page navigation ────────────────────────────────────────────────────────
 	case strings.HasPrefix(data, "page:"):
 		page := parseTrailingInt(data, "page:")
 		b.refreshListMessage(cq.Message, page)
 
-	// ── single delete: show confirm ────────────────────────────────────────────
 	case strings.HasPrefix(data, "del:"):
 		code := strings.TrimPrefix(data, "del:")
-		rec, err := b.db.Get(code)
-		if err != nil || rec == nil {
-			b.editText(cq.Message, "❌ Record not found — it may already be deleted\\.")
+		msgs, err := b.db.GetBundle(code)
+		if err != nil || msgs == nil {
+			b.editText(cq.Message, "❌ Bundle not found — it may already be deleted\\.")
 			return
 		}
-		emoji := fileTypeEmoji(rec.FileType)
-		text  := fmt.Sprintf(
-			"❓ Delete `%s`?\n%s *%s*",
-			code, emoji, escMD(truncate(rec.FileName, 48)),
+		text := fmt.Sprintf(
+			"❓ Delete bundle `%s`?\n_%d file%s will be removed\\._",
+			code, len(msgs), pluralS(len(msgs)),
 		)
-		b.editTextAndKeyboard(cq.Message, text, BuildConfirmDeleteOne(rec))
+		b.editTextAndKeyboard(cq.Message, text, BuildConfirmDeleteOne(code, len(msgs)))
 
-	// ── single delete: confirmed ───────────────────────────────────────────────
 	case strings.HasPrefix(data, "delok:"):
 		code := strings.TrimPrefix(data, "delok:")
-		deleted, err := b.db.Delete(code)
+		deleted, err := b.db.DeleteBundle(code)
 		if err != nil {
-			log.Printf("db.Delete error: %v", err)
 			b.editText(cq.Message, "⚠️ DB error\\.")
 			return
 		}
@@ -288,16 +371,13 @@ func (b *Bot) handleCallback(cq *tgbotapi.CallbackQuery) {
 			b.editText(cq.Message, fmt.Sprintf("⚠️ Code `%s` was already gone\\.", escMD(code)))
 			return
 		}
-		// Refresh at page 0
 		b.refreshListMessage(cq.Message, 0)
 
-	// ── delete page: show confirm ──────────────────────────────────────────────
 	case strings.HasPrefix(data, "delpage:"):
 		page := parseTrailingInt(data, "delpage:")
-		text := fmt.Sprintf("❓ Delete *all files on page %d*?", page+1)
+		text := fmt.Sprintf("❓ Delete *all bundles on page %d*?", page+1)
 		b.editTextAndKeyboard(cq.Message, text, BuildConfirmDeletePage(page))
 
-	// ── delete page: confirmed ─────────────────────────────────────────────────
 	case strings.HasPrefix(data, "delpageok:"):
 		page     := parseTrailingInt(data, "delpageok:")
 		codes, err := b.db.CodesOnPage(page*b.cfg.PageSize, b.cfg.PageSize)
@@ -305,30 +385,25 @@ func (b *Bot) handleCallback(cq *tgbotapi.CallbackQuery) {
 			b.editText(cq.Message, "⚠️ DB error\\.")
 			return
 		}
-		deleted, err := b.db.DeleteMany(codes)
-		if err != nil {
+		if _, err := b.db.DeleteBundles(codes); err != nil {
 			b.editText(cq.Message, "⚠️ DB error during deletion\\.")
 			return
 		}
-		_ = deleted
 		b.refreshListMessage(cq.Message, 0)
 
-	// ── delete all: show confirm ───────────────────────────────────────────────
 	case data == "delall":
-		total, _ := b.db.Count()
-		text := fmt.Sprintf("❓ Delete *all %d files*? This cannot be undone\\.", total)
+		total, _ := b.db.CountBundles()
+		text := fmt.Sprintf("❓ Delete *all %d bundles*? This cannot be undone\\.", total)
 		b.editTextAndKeyboard(cq.Message, text, BuildConfirmDeleteAll())
 
-	// ── delete all: confirmed ──────────────────────────────────────────────────
 	case data == "delallok":
-		deleted, err := b.db.DeleteAll()
+		deleted, err := b.db.DeleteAllBundles()
 		if err != nil {
-			log.Printf("db.DeleteAll error: %v", err)
 			b.editText(cq.Message, "⚠️ DB error\\.")
 			return
 		}
 		b.editText(cq.Message,
-			fmt.Sprintf("💣 Deleted all *%d* file%s\\.", deleted, pluralS(int(deleted))),
+			fmt.Sprintf("💣 Deleted all *%d* bundle%s\\.", deleted, pluralS(int(deleted))),
 		)
 	}
 }
@@ -354,25 +429,24 @@ func (b *Bot) reply(m *tgbotapi.Message, text string) {
 func (b *Bot) editText(m *tgbotapi.Message, text string) {
 	edit := tgbotapi.NewEditMessageText(m.Chat.ID, m.MessageID, text)
 	edit.ParseMode = tgbotapi.ModeMarkdownV2
-	b.api.Request(edit) //nolint:errcheck
+	b.api.Request(edit)
 }
 
 func (b *Bot) editTextAndKeyboard(m *tgbotapi.Message, text string, kb tgbotapi.InlineKeyboardMarkup) {
 	edit := tgbotapi.NewEditMessageText(m.Chat.ID, m.MessageID, text)
 	edit.ParseMode   = tgbotapi.ModeMarkdownV2
 	edit.ReplyMarkup = &kb
-	b.api.Request(edit) //nolint:errcheck
+	b.api.Request(edit)
 }
 
 func (b *Bot) refreshListMessage(m *tgbotapi.Message, page int) {
-	total, err := b.db.Count()
+	total, err := b.db.CountBundles()
 	if err != nil {
 		b.editText(m, "⚠️ DB error\\.")
 		return
 	}
-
 	if total == 0 {
-		b.editText(m, "📂 No files stored yet\\.")
+		b.editText(m, "📂 No bundles stored yet\\.")
 		return
 	}
 
@@ -382,14 +456,14 @@ func (b *Bot) refreshListMessage(m *tgbotapi.Message, page int) {
 		page = totalPages - 1
 	}
 
-	records, err := b.db.Page(page*pageSize, pageSize)
+	bundles, err := b.db.PageBundles(page*pageSize, pageSize)
 	if err != nil {
 		b.editText(m, "⚠️ DB error\\.")
 		return
 	}
 
 	text := ListMessageText(total, page, pageSize)
-	kb   := BuildListKeyboard(records, page, totalPages)
+	kb   := BuildListKeyboard(bundles, page, totalPages)
 	b.editTextAndKeyboard(m, text, kb)
 }
 
