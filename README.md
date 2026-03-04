@@ -4,14 +4,14 @@
 > ## ⚠️ AI-Generated Project
 > **This entire project — every line of code, every config file, and this README — was written by [Claude](https://claude.ai) (Anthropic). It was not written by a human developer.**
 >
-> No code was manually authored. The bot was built iteratively through a conversation with Claude, including debugging, fixing driver compatibility issues, resolving SQLite concurrency bugs, and UI tweaks — all AI-generated.
+> No code was manually authored. The bot was built iteratively through a conversation with Claude, including debugging, fixing driver compatibility issues, resolving SQLite concurrency bugs, schema refactors, and UI tweaks — all AI-generated.
 >
 > Use in production at your own discretion.
 
 ---
 
-A Telegram bot that lets admins store files behind anonymous 9-character codes.
-Users retrieve files with `/send <code>` — they never see who uploaded the file or from which chat.
+A Telegram bot that lets admins store bundles of files behind anonymous 9-character codes.
+Users retrieve files with `/send <code>` — they never see who uploaded the files or from which chat.
 
 ---
 
@@ -19,13 +19,15 @@ Users retrieve files with `/send <code>` — they never see who uploaded the fil
 
 | Feature | Detail |
 |---|---|
+| **Bundle support** | One code can deliver multiple files, sent to the user in order |
 | **Anonymous delivery** | Uses `CopyMessage` (not `ForwardMessage`), so no source chat or uploader is ever revealed |
 | **Random codes** | Cryptographically random 9-char alphanumeric (`a–z`, `0–9`) via `crypto/rand`, collision-checked |
 | **Supported file types** | Documents, photos, videos, audio, voice notes, video notes, animations, stickers |
-| **Paginated admin list** | `/listfiles` with inline keyboard — handles hundreds of files cleanly |
+| **Paginated admin list** | `/listfiles` with inline keyboard — handles hundreds of bundles cleanly |
 | **Bulk delete** | Delete by code(s), delete whole page, or wipe everything — all with confirm prompts |
-| **Concurrent-safe writes** | `sync.Mutex` on all DB writes so bulk uploads (10+ files at once) never deadlock |
+| **Concurrent-safe writes** | `sync.Mutex` on all DB writes so bulk uploads never deadlock |
 | **Pure-Go SQLite** | Uses `modernc.org/sqlite` — no CGO, no gcc, works on Windows out of the box |
+| **Deep links** | Every bundle gets a `t.me/yourbot?start=<code>` link for easy sharing |
 | **Docker ready** | Single binary, minimal Alpine image, `compose.yaml` included |
 
 ---
@@ -71,7 +73,7 @@ All config is via `.env` file (or plain environment variables):
 | `BOT_TOKEN` | ✅ | — | Token from @BotFather |
 | `ADMIN_IDS` | ✅ | — | Comma-separated Telegram user IDs |
 | `DB_PATH` | ❌ | `filestore.db` | Path to SQLite database file |
-| `PAGE_SIZE` | ❌ | `8` | Files shown per page in `/listfiles` |
+| `PAGE_SIZE` | ❌ | `8` | Bundles shown per page in `/listfiles` |
 
 ---
 
@@ -80,39 +82,87 @@ All config is via `.env` file (or plain environment variables):
 ### User commands
 | Command | Description |
 |---|---|
-| `/send <code>` | Retrieve a file by its 9-char code |
+| `/send <code>` | Retrieve all files in a bundle by its 9-char code |
 | `/help` | Show help |
 
 ### Admin commands
 | Command | Description |
 |---|---|
-| `/listfiles` | Browse all stored files with inline pagination |
-| `/delete code1 [code2 …]` | Delete one or more files by code |
-| `/stats` | Show total count, newest/oldest file |
+| `/begin` | Start a new bundle recording session |
+| `/done` | End the session, save the bundle, receive the code |
+| `/cancel` | Discard the current bundle without saving |
+| `/listfiles` | Browse all stored bundles with inline pagination |
+| `/delete code1 [code2 …]` | Delete one or more bundles by code |
+| `/stats` | Show total count, newest/oldest bundle |
 | `/help` | Show admin help |
 
-Admins can also **just send any file** to the bot — it replies with the generated code.
+---
+
+## Admin workflow
+
+Creating a bundle is a three-step process:
+
+```
+/begin
+```
+The bot confirms the session is open. Now send as many files as you want — one at a time or in bulk. The bot acknowledges each one:
+```
+📄 Added Ben_10_S01E01.mkv
+Bundle total: 1 file — send /done when finished
+```
+When all files are sent:
+```
+/done
+```
+The bot saves the bundle and replies with the code and a ready-to-share deep link:
+```
+✅ Bundle saved!
+
+Code: abcd56789
+Files: 10
+
+Share this code or link:
+/send abcd56789
+🔗 https://t.me/yourbotname?start=abcd56789
+```
+
+To discard a bundle mid-session without saving:
+```
+/cancel
+```
+
+> Sending a file to the bot **outside** of a `/begin` session will not create a code — the bot will prompt you to use `/begin` first.
+
+---
+
+## Deep links
+
+Every bundle gets a shareable Telegram deep link:
+
+```
+https://t.me/yourbotname?start=<code>
+```
+
+When a user clicks the link, Telegram opens the bot and automatically sends `/start <code>`, which delivers all files in the bundle. If the user has never opened the bot before, Telegram shows a **Start** button they must tap first — this is a Telegram platform restriction and cannot be bypassed.
 
 ---
 
 ## Admin UI — `/listfiles`
 
 ```
-📂 File Store — 10 files
+📂 Bundle Store — 10 bundles
 Page 1 of 2 · showing 1–8 · tap a row to delete
 
-🗑  z449nia67  📄  Ben_10_2005_S04E10_Good...  03 Mar 26
-🗑  r6ldh81sf  📄  Ben_10_2005_S04E01_Perf...  03 Mar 26
-🗑  pf9vmysdi  📄  Ben_10_2005_S04E05_Ben_...  03 Mar 26
+🗑  z449nia67  ·  10 files     ·  03 Mar 26
+🗑  r6ldh81sf  ·  4 files      ·  03 Mar 26
+🗑  pf9vmysdi  ·  1 file       ·  03 Mar 26
 ...
 
 [ 1 / 2 ]  [ Next ▶ ]
 [ 🗑 Delete This Page ]  [ 💣 Delete ALL ]  [ ✖ Close ]
 ```
 
-- Tapping a file row shows a **confirm / cancel** prompt before deleting
-- Bulk actions (delete page, delete all) also require a confirmation tap
-- Filenames are truncated at 32 characters in the list view
+Tapping a bundle row shows a confirm/cancel prompt before deleting. Bulk actions also require a confirmation tap.
 
 ---
 
@@ -122,11 +172,24 @@ Page 1 of 2 · showing 1–8 · tap a row to delete
 docker compose up -d
 ```
 
-The `compose.yaml` reads your `.env` file automatically and mounts `./data/` for the database, so it survives container rebuilds and updates.
+The `compose.yaml` reads your `.env` file automatically and mounts `./data/` on the host for the database, so it survives container rebuilds.
 
 ```
 ./data/filestore.db   ← persisted on the host
 ```
+
+---
+
+## Database schema
+
+Two tables, with cascade deletes so removing a bundle cleans up all its messages automatically:
+
+```sql
+bundles (code, created_at)
+bundle_messages (id, code → bundles, chat_id, message_id, file_name, file_type, position)
+```
+
+> ⚠️ If you were using an earlier version of this bot with the single-file schema, delete your `filestore.db` and let it recreate — the schemas are not compatible.
 
 ---
 
@@ -146,7 +209,8 @@ The `compose.yaml` reads your `.env` file automatically and mounts `./data/` for
 filestore-bot/
 ├── main.go        ← entry point, update loop
 ├── config.go      ← env var loading & admin check
-├── db.go          ← SQLite CRUD, code generation, write mutex
+├── db.go          ← SQLite CRUD, bundle schema, code generation, write mutex
+├── session.go     ← in-memory recording session store (thread-safe)
 ├── handlers.go    ← all command & callback handlers
 ├── keyboard.go    ← inline keyboard builders & text formatters
 ├── go.mod
@@ -159,6 +223,6 @@ filestore-bot/
 
 ## Known limitations
 
-- Telegram button labels max out at ~64 characters — filenames are truncated at 32 chars in the list view to fit the code, emoji, and date alongside
-- `CopyMessage` will fail silently if the original source message is deleted from the upload chat — the bot will notify the user if this happens
-- SQLite is single-writer; concurrent writes are serialised via mutex (this is fine for any realistic bot load)
+- `CopyMessage` will fail silently if the original source message is deleted from the upload chat — the bot will notify the user per-file if this happens
+- SQLite is single-writer; concurrent writes are serialised via mutex (fine for any realistic bot load)
+- Telegram button labels have a ~64 character cap; bundle list rows show code, file count, and date only
