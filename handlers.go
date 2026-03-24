@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
@@ -206,17 +207,38 @@ func (b *Bot) handleFileFromAdmin(m *tgbotapi.Message) {
 		FileType:  fileType,
 	}
 
-	rank, total, ok := b.sessions.AppendAndRank(uid, msg)
-	if !ok {
-		// Session disappeared between IsRecording and AppendAndRank (race on /cancel).
-		return
-	}
+	chatID := m.Chat.ID
 
-	emoji := fileTypeEmoji(fileType)
-	b.reply(m, fmt.Sprintf(
-		"%s Added `%s`\n_Sorted position: *%d of %d* — send `/done` when finished_",
-		emoji, escMD(truncate(fileName, 40)), rank, total,
+	// Append and (re)start the 1-second debounce window. No per-file reply is
+	// sent here. Instead, once a full second passes with no new file arriving,
+	// onFlush fires once with the complete sorted list — giving the admin a
+	// single, clean summary instead of N noisy "Added …" messages.
+	b.sessions.AppendAndDebounce(uid, msg, time.Second, func(sorted []BundleMessage) {
+		b.sendSortedList(chatID, sorted)
+	})
+}
+
+// sendSortedList sends the admin a single message listing all queued files in
+// sorted order. Called by the debounce callback after the 1-second quiet window.
+func (b *Bot) sendSortedList(chatID int64, msgs []BundleMessage) {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf(
+		"\U0001f4e6 *%d file%s queued \u2014 sorted order:*\n\n",
+		len(msgs), pluralS(len(msgs)),
 	))
+	for i, m := range msgs {
+		sb.WriteString(fmt.Sprintf(
+			"%d\\. `%s`\n",
+			i+1, escMD(truncate(m.FileName, 50)),
+		))
+	}
+	sb.WriteString("\n_Send more files, or `/done` to save\\._")
+
+	out := tgbotapi.NewMessage(chatID, sb.String())
+	out.ParseMode = tgbotapi.ModeMarkdownV2
+	if _, err := b.api.Send(out); err != nil {
+		log.Printf("sendSortedList error: %v", err)
+	}
 }
 
 // ── /send <code> ──────────────────────────────────────────────────────────────

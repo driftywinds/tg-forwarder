@@ -1,10 +1,14 @@
 package main
 
-import "sync"
+import (
+	"sync"
+	"time"
+)
 
 // session holds the pending messages for one admin mid-recording.
 type session struct {
-	messages []BundleMessage
+	messages      []BundleMessage
+	debounceTimer *time.Timer
 }
 
 // SessionStore is a thread-safe map of adminID → active recording session.
@@ -34,40 +38,61 @@ func (s *SessionStore) IsRecording(adminID int64) bool {
 	return ok
 }
 
-// AppendAndRank appends msg to the session and atomically returns the 1-based
-// sorted position it will occupy and the new total count. Doing both under one
-// lock prevents a race where concurrent bulk-forward goroutines interleave an
-// Append and a separate rank query, which would produce a stale total.
+// AppendAndDebounce appends msg to the session, resets the debounce timer to
+// delay, and returns false if no session is active.
 //
-// The second return value (ok) is false when no session is active.
-func (s *SessionStore) AppendAndRank(adminID int64, msg BundleMessage) (rank, total int, ok bool) {
+// The first file in a bulk forward starts a 1-second countdown. Every
+// subsequent file that arrives before the countdown expires cancels it and
+// starts a fresh one. Only when a full second passes with no new file does
+// onFlush fire — receiving a sorted snapshot of everything collected so far.
+//
+// This means 20 files forwarded in rapid succession produce exactly one
+// feedback message to the admin, not 20.
+//
+// onFlush is called from a background goroutine; it must not hold s.mu.
+func (s *SessionStore) AppendAndDebounce(
+	adminID int64,
+	msg BundleMessage,
+	delay time.Duration,
+	onFlush func(msgs []BundleMessage),
+) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	sess, exists := s.sessions[adminID]
-	if !exists {
-		return 0, 0, false
+	sess, ok := s.sessions[adminID]
+	if !ok {
+		return false
 	}
 
 	sess.messages = append(sess.messages, msg)
 
-	// Sort a shallow copy to find the sorted rank without mutating session order.
-	// For typical bundle sizes (≤ a few hundred files) this is instantaneous.
-	tmp := make([]BundleMessage, len(sess.messages))
-	copy(tmp, sess.messages)
-	sortBundleMessages(tmp)
-
-	total = len(tmp)
-	for i, m := range tmp {
-		if m.FileName == msg.FileName && m.ChatID == msg.ChatID && m.MessageID == msg.MessageID {
-			return i + 1, total, true
-		}
+	// Cancel any in-flight timer before starting a new one.
+	if sess.debounceTimer != nil {
+		sess.debounceTimer.Stop()
 	}
-	// Fallback: should never be reached, but be safe.
-	return total, total, true
+
+	sess.debounceTimer = time.AfterFunc(delay, func() {
+		// Take a sorted snapshot under the lock, then call onFlush outside it.
+		s.mu.Lock()
+		sess2, exists := s.sessions[adminID]
+		if !exists {
+			s.mu.Unlock()
+			return
+		}
+		snapshot := make([]BundleMessage, len(sess2.messages))
+		copy(snapshot, sess2.messages)
+		sess2.debounceTimer = nil
+		s.mu.Unlock()
+
+		sortBundleMessages(snapshot)
+		onFlush(snapshot)
+	})
+
+	return true
 }
 
 // End finalises and returns the collected messages, then clears the session.
+// Any pending debounce timer is stopped so it cannot fire after /done.
 // Returns nil if no session was active.
 func (s *SessionStore) End(adminID int64) []BundleMessage {
 	s.mu.Lock()
@@ -76,17 +101,25 @@ func (s *SessionStore) End(adminID int64) []BundleMessage {
 	if !ok {
 		return nil
 	}
+	if sess.debounceTimer != nil {
+		sess.debounceTimer.Stop()
+	}
 	msgs := sess.messages
 	delete(s.sessions, adminID)
 	return msgs
 }
 
 // Cancel discards the session without saving.
+// Any pending debounce timer is stopped.
 func (s *SessionStore) Cancel(adminID int64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.sessions[adminID]; !ok {
+	sess, ok := s.sessions[adminID]
+	if !ok {
 		return false
+	}
+	if sess.debounceTimer != nil {
+		sess.debounceTimer.Stop()
 	}
 	delete(s.sessions, adminID)
 	return true
