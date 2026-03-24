@@ -151,6 +151,12 @@ func (b *Bot) cmdDone(m *tgbotapi.Message) {
 		return
 	}
 
+	// Sort files alphabetically / numerically before persisting so that
+	// users always receive them in a predictable order regardless of the
+	// sequence Telegram forwarded them in. Old bundles already in the DB
+	// are not affected — their position values remain unchanged.
+	sortBundleMessages(msgs)
+
 	code, err := b.db.InsertBundle(msgs)
 	if err != nil {
 		log.Printf("InsertBundle error: %v", err)
