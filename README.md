@@ -1,4 +1,4 @@
-# FileStore Bot
+# Telegram Forwarder Bot
 
 > [!IMPORTANT]
 > ## ⚠️ AI-Generated Project
@@ -20,6 +20,8 @@ Users retrieve files with `/send <code>` — they never see who uploaded the fil
 | Feature | Detail |
 |---|---|
 | **Bundle support** | One code can deliver multiple files, sent to the user in order |
+| **Automatic sorting** | Files in a bundle are always sorted in natural alphanumeric order at save time — `S01E02` before `S01E10`, regardless of the order Telegram forwarded them |
+| **Debounced bulk feedback** | When forwarding many files at once, the bot waits 1 second after the last file arrives before sending a single sorted summary — no per-file message spam |
 | **Anonymous delivery** | Uses `CopyMessage` (not `ForwardMessage`), so no source chat or uploader is ever revealed |
 | **Random codes** | Cryptographically random 9-char alphanumeric (`a–z`, `0–9`) via `crypto/rand`, collision-checked |
 | **Supported file types** | Documents, photos, videos, audio, voice notes, video notes, animations, stickers |
@@ -43,8 +45,8 @@ Users retrieve files with `/send <code>` — they never see who uploaded the fil
 ### 1. Clone & configure
 
 ```bash
-git clone <your-repo>
-cd filestore-bot
+git clone https://github.com/driftywinds/tg-forwarder
+cd tg-forwarder
 copy .env.example .env
 # Edit .env — fill in BOT_TOKEN and ADMIN_IDS
 ```
@@ -59,7 +61,7 @@ go run .
 ### 3. Build a binary
 
 ```bash
-go build -o filestore-bot.exe .
+go build -o tg-forwarder.exe .
 ```
 
 ---
@@ -105,11 +107,22 @@ Creating a bundle is a three-step process:
 ```
 /begin
 ```
-The bot confirms the session is open. Now send as many files as you want — one at a time or in bulk. The bot acknowledges each one:
+The bot confirms the session is open. Now send as many files as you want — one at a time or in bulk.
+
+For single files the bot responds immediately. For bulk forwards (e.g. 20 files forwarded at once), the bot stays silent while files are arriving and sends **one consolidated message** 1 second after the last file lands, showing the full sorted list:
 ```
-📄 Added Ben_10_S01E01.mkv
-Bundle total: 1 file — send /done when finished
+📦 20 files queued — sorted order:
+
+1. `Heated_Rivalry_S01E01_Rookies_1080p...`
+2. `Heated_Rivalry_S01E02_Olympians_108...`
+3. `Heated_Rivalry_S01E03_1080p_AMZN_WE...`
+...
+20. `Heated_Rivalry_S01E20_...`
+
+Send more files, or /done to save.
 ```
+Files are sorted using natural alphanumeric order — dot, dash and underscore separators are treated as equivalent, and numeric segments are compared as integers so `S01E09` always sorts before `S01E10`.
+
 When all files are sent:
 ```
 /done
@@ -206,12 +219,13 @@ bundle_messages (id, code → bundles, chat_id, message_id, file_name, file_type
 ## Project structure
 
 ```
-filestore-bot/
+tg-forwarder/
 ├── main.go        ← entry point, update loop
 ├── config.go      ← env var loading & admin check
 ├── db.go          ← SQLite CRUD, bundle schema, code generation, write mutex
 ├── session.go     ← in-memory recording session store (thread-safe)
 ├── handlers.go    ← all command & callback handlers
+├── sort.go        ← natural alphanumeric sort for bundle filenames
 ├── keyboard.go    ← inline keyboard builders & text formatters
 ├── go.mod
 ├── compose.yaml
