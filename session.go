@@ -34,15 +34,37 @@ func (s *SessionStore) IsRecording(adminID int64) bool {
 	return ok
 }
 
-func (s *SessionStore) Append(adminID int64, msg BundleMessage) bool {
+// AppendAndRank appends msg to the session and atomically returns the 1-based
+// sorted position it will occupy and the new total count. Doing both under one
+// lock prevents a race where concurrent bulk-forward goroutines interleave an
+// Append and a separate rank query, which would produce a stale total.
+//
+// The second return value (ok) is false when no session is active.
+func (s *SessionStore) AppendAndRank(adminID int64, msg BundleMessage) (rank, total int, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	sess, ok := s.sessions[adminID]
-	if !ok {
-		return false
+
+	sess, exists := s.sessions[adminID]
+	if !exists {
+		return 0, 0, false
 	}
+
 	sess.messages = append(sess.messages, msg)
-	return true
+
+	// Sort a shallow copy to find the sorted rank without mutating session order.
+	// For typical bundle sizes (≤ a few hundred files) this is instantaneous.
+	tmp := make([]BundleMessage, len(sess.messages))
+	copy(tmp, sess.messages)
+	sortBundleMessages(tmp)
+
+	total = len(tmp)
+	for i, m := range tmp {
+		if m.FileName == msg.FileName && m.ChatID == msg.ChatID && m.MessageID == msg.MessageID {
+			return i + 1, total, true
+		}
+	}
+	// Fallback: should never be reached, but be safe.
+	return total, total, true
 }
 
 // End finalises and returns the collected messages, then clears the session.

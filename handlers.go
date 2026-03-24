@@ -206,13 +206,16 @@ func (b *Bot) handleFileFromAdmin(m *tgbotapi.Message) {
 		FileType:  fileType,
 	}
 
-	b.sessions.Append(uid, msg)
-	count := b.sessions.Count(uid)
+	rank, total, ok := b.sessions.AppendAndRank(uid, msg)
+	if !ok {
+		// Session disappeared between IsRecording and AppendAndRank (race on /cancel).
+		return
+	}
 
 	emoji := fileTypeEmoji(fileType)
 	b.reply(m, fmt.Sprintf(
-		"%s Added `%s`\n_Bundle total: %d file%s — send `/done` when finished_",
-		emoji, escMD(truncate(fileName, 40)), count, pluralS(count),
+		"%s Added `%s`\n_Sorted position: *%d of %d* — send `/done` when finished_",
+		emoji, escMD(truncate(fileName, 40)), rank, total,
 	))
 }
 
