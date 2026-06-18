@@ -12,6 +12,7 @@ type Config struct {
 	AdminIDs map[int64]bool
 	DBPath   string
 	PageSize int
+	ProxyURL string
 }
 
 func loadConfig() (*Config, error) {
@@ -58,6 +59,7 @@ func loadConfig() (*Config, error) {
 		AdminIDs: adminIDs,
 		DBPath:   dbPath,
 		PageSize: pageSize,
+		ProxyURL: os.Getenv("PROXY_URL"),
 	}, nil
 }
 

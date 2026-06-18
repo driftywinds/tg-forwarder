@@ -29,6 +29,18 @@ func main() {
 	if err != nil {
 		log.Fatalf("Telegram API error: %v", err)
 	}
+
+	if cfg.ProxyURL != "" {
+		pxyClient, pxyErr := newProxyHTTPClient(cfg.ProxyURL)
+		if pxyErr != nil {
+			log.Fatalf("Proxy error: %v", pxyErr)
+		}
+		api.Client = pxyClient
+		log.Printf("Using SOCKS5 proxy: %s", proxyAddr(cfg.ProxyURL))
+	} else {
+		log.Printf("No proxy configured (set PROXY_URL to use one)")
+	}
+
 	log.Printf("Logged in as @%s", api.Self.UserName)
 
 	bot := NewBot(api, db, cfg)
