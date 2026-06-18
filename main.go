@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"net/http"
 	"os"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -25,22 +26,25 @@ func main() {
 	}
 	log.Printf("Database opened: %s", cfg.DBPath)
 
-	api, err := tgbotapi.NewBotAPI(cfg.BotToken)
-	if err != nil {
-		log.Fatalf("Telegram API error: %v", err)
-	}
-
+	// Build the HTTP client (with or without proxy) before connecting to Telegram.
+	// NewBotAPIWithClient calls getMe internally, so the proxy must be in place first.
+	var httpClient *http.Client
 	if cfg.ProxyURL != "" {
 		pxyClient, pxyErr := newProxyHTTPClient(cfg.ProxyURL)
 		if pxyErr != nil {
 			log.Fatalf("Proxy error: %v", pxyErr)
 		}
-		api.Client = pxyClient
+		httpClient = pxyClient
 		log.Printf("Using SOCKS5 proxy: %s", proxyAddr(cfg.ProxyURL))
 	} else {
+		httpClient = &http.Client{}
 		log.Printf("No proxy configured (set PROXY_URL to use one)")
 	}
 
+	api, err := tgbotapi.NewBotAPIWithClient(cfg.BotToken, tgbotapi.APIEndpoint, httpClient)
+	if err != nil {
+		log.Fatalf("Telegram API error: %v", err)
+	}
 	log.Printf("Logged in as @%s", api.Self.UserName)
 
 	bot := NewBot(api, db, cfg)
